@@ -35,19 +35,27 @@ import sys
 import yaml
 import json
 
-from babel import support, Locale
+from babel import support
 
 from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy import engine_from_config
 
 from pyramid.paster import get_appsettings
 
-from chsdi.models.bod import LayersConfig
 from chsdi.models.bod import get_wmts_models
+from chsdi.lib.filters import filter_by_geodata_staging
 
 
 DEBUG = False
 LANG = 'de'
+STAGING = 'prod'
+
+total_timestamps = 0
+
+EPSG_CODES = ['4258',  # ETRS89 (source: epsg-registry.org, but many WMTS client use 4852)
+              '4326',  # WGS1984
+              '2056',  # LV95
+              '3857']  # Pseudo-Mercator Webmapping
 
 current_timestamps = {}
 
@@ -65,7 +73,12 @@ def getLayersConfigs():
 
     models = get_wmts_models(LANG)
     layers_query = DBSession.query(models['GetCap'])
-    layers_query = layers_query.filter(models['GetCap'].maps.ilike('%%%s%%' % 'api'))  
+    layers_query = layers_query.filter(models['GetCap'].maps.ilike('%%%s%%' % 'api'))
+    layers_query = filter_by_geodata_staging(
+        layers_query,
+        models['GetCap'].staging,
+        STAGING
+    )
     DBSession.close()
 
     return [q for q in layers_query.all()]
@@ -88,13 +101,14 @@ for part in ['caches', 'sources']:
 if mapproxy_config['layers'] is None:
     mapproxy_config['layers'] = []
 
-for layersConfig in getLayersConfigs():
+for idx, layersConfig in enumerate(getLayersConfigs()):
     if layersConfig and layersConfig.maps is not None:
         if layersConfig.timestamp is not None and 'api' in layersConfig.maps:
-            print layersConfig.bod_layer_id
+            print idx, layersConfig.bod_layer_id
             bod_layer_id = layersConfig.bod_layer_id
 
             timestamps = layersConfig.timestamp.split(',')
+            total_timestamps += len(timestamps)
             current_timestamp = timestamps[0]
             image_format = layersConfig.arr_all_formats.split(',')[0]
             server_layer_name = bod_layer_id
@@ -117,10 +131,9 @@ for layersConfig in getLayersConfigs():
                 cache_name = "%s_%s_cache_out" % (bod_layer_id, timestamp)
                 layer_name = "%s_%s" % (bod_layer_id, timestamp)
                 dimensions = {'Time': {'default': timestamp, 'values': [timestamp]}}
-    
-                # layer config: cache_out
-                layer = {'name': layer_name, 'title': title, 'dimensions': dimensions, 'sources': [cache_name]}
 
+                # layer config: cache_out
+                layer = {'name': layer_name, 'title': "%s (%s)" % (title, timestamp), 'dimensions': dimensions, 'sources': [cache_name]}
 
                 cache = {"sources": [wmts_cache_name], "format": "image/%s" % image_format, "grids": grid_names, "disable_storage": True, "meta_size": [1, 1], "meta_buffer": 0}
 
@@ -128,13 +141,13 @@ for layersConfig in getLayersConfigs():
                     cache["image"] = {"resampling_method": "bilinear"}
                 elif '.swisstlm3d-karte' in wmts_cache_name:
                     cache["image"] = {"resampling_method": "nearest"}
-    
+
                 mapproxy_config['layers'].append(layer)
                 mapproxy_config['caches'][cache_name] = cache
-    
+
                 # original source (one for all projection)
                 wmts_url = "http://wmts6.geo.admin.ch/1.0.0/" + server_layer_name + "/default/" + timestamp + "/21781/%(z)d/%(y)d/%(x)d.%(format)s"
-    
+
                 wmts_source = {"url": wmts_url,
                                "type": "tile",
                                "grid": "swisstopo-pixelkarte",
@@ -151,27 +164,31 @@ for layersConfig in getLayersConfigs():
                                    }
                                },
                                "coverage": {"bbox": [420000, 30000, 900000, 350000], "bbox_srs": "EPSG:21781"}}
-    
+
                 wmts_cache = {"sources": [wmts_source_name], "format": "image/%s" % image_format, "grids": ["swisstopo-pixelkarte"], "disable_storage": True}
 
                 if '.swissimage' in wmts_cache_name:
                     wmts_source["grid"] = "swisstopo-swissimage"
                     wmts_cache["grids"] = ["swisstopo-swissimage"]
-    
-                wmts_layer = {'name': wmts_source_name, 'title': title, 'dimensions': dimensions, 'sources': [wmts_cache_name]}
-                wmts_layer_current = {'name': wmts_source_name, 'title': title, 'dimensions': dimensions, 'sources': [wmts_cache_name]}
+
+                layer_title = "%s (%s, source)" % (title, timestamp)
+                wmts_layer = {'name': wmts_source_name, 'title': layer_title, 'dimensions': dimensions, 'sources': [wmts_cache_name]}
+                wmts_layer_current = {'name': wmts_source_name, 'title': "%s ('alias')" % title, 'dimensions': dimensions, 'sources': [wmts_cache_name]}
 
                 if timestamp == current_timestamp:
-                    layer_current = {'name': bod_layer_id, 'title': title, 'dimensions': dimensions, 'sources': [wmts_cache_name]}
+                    layer_current = {'name': bod_layer_id, 'title': "%s ('current')" % title, 'dimensions': dimensions, 'sources': [wmts_cache_name]}
                     mapproxy_config['layers'].append(layer_current)
-    
+
                 if DEBUG:
                     print layer
-    
+
                 mapproxy_config['layers'].append(wmts_layer)
                 mapproxy_config['caches'][wmts_cache_name] = wmts_cache
                 mapproxy_config['sources'][wmts_source_name] = wmts_source
-    
+
+print "=============="
+print "Layers: %d, timestamps: %d" % (idx + 1, total_timestamps)
+
 if DEBUG:
     print json.dumps(mapproxy_config, sort_keys=False, indent=4)
 
@@ -179,4 +196,3 @@ if DEBUG:
 with open('mapproxy/mapproxy.yaml', 'w') as o:
     o.write("# This is a generated file. Do not edit.\n\n")
     o.write(yaml.safe_dump(mapproxy_config, encoding=None))
-
